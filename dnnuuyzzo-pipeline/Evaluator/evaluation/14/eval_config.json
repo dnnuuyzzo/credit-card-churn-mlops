@@ -1,0 +1,54 @@
+{
+  "evalConfig": {
+    "modelSpecs": [
+      {
+        "labelKey": "Attrition_Flag"
+      }
+    ],
+    "slicingSpecs": [
+      {},
+      {
+        "featureKeys": [
+          "Gender"
+        ]
+      }
+    ],
+    "metricsSpecs": [
+      {
+        "metrics": [
+          {
+            "className": "AUC"
+          },
+          {
+            "className": "BinaryAccuracy"
+          },
+          {
+            "className": "Precision"
+          },
+          {
+            "className": "Recall"
+          },
+          {
+            "className": "ExampleCount"
+          }
+        ],
+        "modelNames": [
+          ""
+        ],
+        "thresholds": {
+          "auc": {
+            "valueThreshold": {
+              "lowerBound": 0.5
+            }
+          }
+        }
+      }
+    ]
+  },
+  "version": "0.42.0",
+  "dataLocation": "<user provided PCollection>",
+  "fileFormat": "<unknown>",
+  "modelLocations": {
+    "": "dnnuuyzzo-pipeline\\Trainer\\model\\12\\Format-Serving"
+  }
+}

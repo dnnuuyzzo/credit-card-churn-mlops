@@ -1,0 +1,259 @@
+﻿================================================================================
+# TESTING MODEL SERVING: CREDIT CARD CUSTOMERS CHURN PREDICTION (CLOUD / REST API)
+# Nama: Danuardi Saputro
+# Username Dicoding: dnnuuyzzo
+# Proyek Akhir: Pengembangan dan Pengoperasian Sistem Machine Learning (MLOps)
+================================================================================
+
+[CELL 1 - MARKDOWN]
+# **Testing Model Serving - Credit Card Customers Churn Prediction**
+**Nama:** Danuardi Saputro  
+**Username Dicoding:** dnnuuyzzo  
+
+---
+
+### **Deskripsi Pengujian**
+Notebook ini digunakan untuk menguji dan memvalidasi inferensi model yang telah di-deploy pada **TensorFlow Serving** di environment Cloud (atau lokal) melalui REST API.
+
+Pengujian mencakup:
+1. Pemeriksaan status dan kesiapan model (*health check* & *metadata inspection*).
+2. Penyiapan data uji profil nasabah dalam format dictionary / JSON mentah (*raw data*).
+3. Serialisasi data uji ke dalam format `tf.train.Example` base64 sesuai kontrak *serving signature* hermetis model.
+4. Pengiriman prediction request via HTTP POST ke endpoint serving.
+5. Ekstraksi probabilitas churn dan interpretasi keputusan bisnis untuk strategi retensi nasabah.
+
+---
+
+[CELL 2 - CODE]
+import base64
+import json
+import requests
+import tensorflow as tf
+
+print(f"TensorFlow Version: {tf.__version__}")
+print(f"Requests Version  : {requests.__version__}")
+
+---
+
+[CELL 3 - MARKDOWN]
+## **1. Konfigurasi Endpoint TensorFlow Serving**
+
+Menentukan host, URL model, serta endpoint REST API.
+- Untuk pengujian di **Cloud Environment (misal: Railway / Heroku / Koyeb / Render)**, ganti variabel `SERVER_BASE_URL` dengan URL cloud aplikasi Anda.
+- Untuk pengujian di **Lokal Docker**, gunakan `http://localhost:8501`.
+
+---
+
+[CELL 4 - CODE]
+# Konfigurasi URL Endpoint (Ubah URL ini sesuai domain cloud deployment Anda)
+SERVER_BASE_URL = "http://localhost:8501" 
+# Contoh Cloud: SERVER_BASE_URL = "https://dnnuuyzzo-churn-model.up.railway.app"
+
+MODEL_NAME = "credit_card_churn_model"
+
+STATUS_URL = f"{SERVER_BASE_URL}/v1/models/{MODEL_NAME}"
+METADATA_URL = f"{SERVER_BASE_URL}/v1/models/{MODEL_NAME}/metadata"
+PREDICT_URL = f"{SERVER_BASE_URL}/v1/models/{MODEL_NAME}:predict"
+
+print(f"Status URL   : {STATUS_URL}")
+print(f"Metadata URL : {METADATA_URL}")
+print(f"Predict URL  : {PREDICT_URL}")
+
+---
+
+[CELL 5 - MARKDOWN]
+## **2. Memeriksa Status & Metadata Model (Health Check)**
+
+Melakukan HTTP GET request untuk memverifikasi bahwa container TensorFlow Serving aktif dan model berada dalam kondisi `AVAILABLE`.
+
+---
+
+[CELL 6 - CODE]
+try:
+    response = requests.get(STATUS_URL, timeout=10)
+    print(f"HTTP Status Code: {response.status_code}")
+    print("Response Body:")
+    print(json.dumps(response.json(), indent=2))
+except Exception as e:
+    print(f"Koneksi gagal atau model belum aktif: {e}")
+
+---
+
+[CELL 7 - MARKDOWN]
+## **3. Helper Function: Serialisasi Raw Data ke tf.train.Example Base64**
+
+Karena model kita menyematkan graph preprocessing dari `tensorflow_transform` langsung ke dalam *serving signature*, endpoint menerima input berupa serialized `tf.train.Example`.
+
+Fungsi di bawah ini mengonversi dictionary data nasabah menjadi format JSON payload base64 yang kompatibel dengan TensorFlow Serving REST API.
+
+---
+
+[CELL 8 - CODE]
+def _bytes_feature(value):
+    """Mengembalikan BytesList dari string / byte."""
+    if isinstance(value, type(tf.constant(0))):
+        value = value.numpy()
+    if isinstance(value, str):
+        value = value.encode('utf-8')
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+def _float_feature(value):
+    """Mengembalikan FloatList dari float / double."""
+    return tf.train.Feature(float_list=tf.train.FloatList(value=[float(value)]))
+
+def _int64_feature(value):
+    """Mengembalikan Int64List dari int / bool."""
+    return tf.train.Feature(int64_list=tf.train.Int64List(value=[int(value)]))
+
+def create_tf_example_payload(record: dict) -> str:
+    """Membuat serialisasi tf.train.Example dan mengembalikannya dalam b64 encoded string."""
+    feature_dict = {}
+    
+    # Fitur Kategorikal (Bytes)
+    categorical_cols = ['Gender', 'Education_Level', 'Marital_Status', 'Income_Category', 'Card_Category']
+    for col in categorical_cols:
+        feature_dict[col] = _bytes_feature(record[col])
+        
+    # Fitur Numerikal Int64
+    int_cols = [
+        'Customer_Age', 'Dependent_count', 'Months_on_book',
+        'Total_Relationship_Count', 'Months_Inactive_12_mon',
+        'Contacts_Count_12_mon', 'Total_Revolving_Bal',
+        'Total_Trans_Amt', 'Total_Trans_Ct'
+    ]
+    for col in int_cols:
+        feature_dict[col] = _int64_feature(record[col])
+        
+    # Fitur Numerikal Float
+    float_cols = [
+        'Credit_Limit', 'Avg_Open_To_Buy', 'Total_Amt_Chng_Q4_Q1',
+        'Total_Ct_Chng_Q4_Q1', 'Avg_Utilization_Ratio'
+    ]
+    for col in float_cols:
+        feature_dict[col] = _float_feature(record[col])
+        
+    example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
+    serialized_example = example.SerializeToString()
+    return base64.b64encode(serialized_example).decode('utf-8')
+
+print("Helper serializer tf.train.Example siap digunakan.")
+
+---
+
+[CELL 9 - MARKDOWN]
+## **4. Menyiapkan Data Nasabah Uji (Sample Test Instances)**
+
+Kita menyiapkan 2 sampel data profil nasabah untuk pengujian:
+- **Nasabah A**: Profil nasabah aktif, transaksi stabil, interaksi rutin (ekspektasi: *Existing Customer* / Probabilitas Churn Rendah).
+- **Nasabah B**: Profil nasabah tidak aktif, saldo bergulir 0, frekuensi transaksi menurun drastis (ekspektasi: *Attrited Customer* / Probabilitas Churn Tinggi).
+
+---
+
+[CELL 10 - CODE]
+sample_nasabah_a = {
+    'Customer_Age': 45,
+    'Gender': 'M',
+    'Dependent_count': 3,
+    'Education_Level': 'High School',
+    'Marital_Status': 'Married',
+    'Income_Category': '$60K - $80K',
+    'Card_Category': 'Blue',
+    'Months_on_book': 39,
+    'Total_Relationship_Count': 5,
+    'Months_Inactive_12_mon': 1,
+    'Contacts_Count_12_mon': 3,
+    'Credit_Limit': 12691.0,
+    'Total_Revolving_Bal': 777,
+    'Avg_Open_To_Buy': 11914.0,
+    'Total_Amt_Chng_Q4_Q1': 1.335,
+    'Total_Trans_Amt': 1144,
+    'Total_Trans_Ct': 42,
+    'Total_Ct_Chng_Q4_Q1': 1.625,
+    'Avg_Utilization_Ratio': 0.061
+}
+
+sample_nasabah_b = {
+    'Customer_Age': 56,
+    'Gender': 'M',
+    'Dependent_count': 2,
+    'Education_Level': 'Graduate',
+    'Marital_Status': 'Single',
+    'Income_Category': '$60K - $80K',
+    'Card_Category': 'Blue',
+    'Months_on_book': 48,
+    'Total_Relationship_Count': 3,
+    'Months_Inactive_12_mon': 4,
+    'Contacts_Count_12_mon': 3,
+    'Credit_Limit': 2193.0,
+    'Total_Revolving_Bal': 0,
+    'Avg_Open_To_Buy': 2193.0,
+    'Total_Amt_Chng_Q4_Q1': 0.389,
+    'Total_Trans_Amt': 612,
+    'Total_Trans_Ct': 11,
+    'Total_Ct_Chng_Q4_Q1': 0.375,
+    'Avg_Utilization_Ratio': 0.0
+}
+
+# Membuat request payload
+b64_a = create_tf_example_payload(sample_nasabah_a)
+b64_b = create_tf_example_payload(sample_nasabah_b)
+
+payload = {
+    "instances": [
+        {"b64": b64_a},
+        {"b64": b64_b}
+    ]
+}
+
+print(f"Payload request berhasil dibuat untuk {len(payload['instances'])} instances.")
+
+---
+
+[CELL 11 - MARKDOWN]
+## **5. Mengirimkan Prediction Request ke REST API**
+
+Mengirimkan HTTP POST request berisi payload serialisasi ke `PREDICT_URL` dan membaca respons prediksi dari model.
+
+---
+
+[CELL 12 - CODE]
+try:
+    headers = {"content-type": "application/json"}
+    response = requests.post(PREDICT_URL, data=json.dumps(payload), headers=headers, timeout=15)
+    
+    print(f"HTTP Status Code: {response.status_code}")
+    predictions = response.json().get('predictions', [])
+    print("Raw Prediction Output:", predictions)
+except Exception as e:
+    print(f"Prediction request error: {e}")
+
+---
+
+[CELL 13 - MARKDOWN]
+## **6. Interpretasi Hasil Prediksi & Rekomendasi Aksi Bisnis**
+
+Memetakan probabilitas output sigmoid (`[0.0 - 1.0]`) menjadi keputusan klasifikasi biner dan rekomendasi tindakan bagi tim retensi perbankan.
+
+---
+
+[CELL 14 - CODE]
+threshold = 0.50
+customers = [
+    ("Nasabah A (Aktif)", sample_nasabah_a),
+    ("Nasabah B (Inaktif / Risiko Churn)", sample_nasabah_b)
+]
+
+for idx, (label, data) in enumerate(customers):
+    prob_churn = predictions[idx][0] if predictions and len(predictions) > idx else 0.0
+    status_prediksi = "ATTRITED (CHURN)" if prob_churn >= threshold else "EXISTING (LOYAL)"
+    
+    print("=" * 60)
+    print(f"Evaluasi Prediksi: {label}")
+    print(f"Probabilitas Churn : {prob_churn:.4f} ({prob_churn * 100:.2f}%)")
+    print(f"Hasil Klasifikasi  : {status_prediksi}")
+    
+    if prob_churn >= threshold:
+        print(">> REKOMENDASI: Berikan program promosi retensi, penawaran cashback, dan kontak langsung oleh Relationship Manager.")
+    else:
+        print(">> REKOMENDASI: Nasabah dalam status aman/loyal. Pertahankan engagement reguler.")
+print("=" * 60)

@@ -1,0 +1,345 @@
+﻿================================================================================
+# MACHINE LEARNING PIPELINE: CREDIT CARD CUSTOMERS CHURN PREDICTION
+# Nama: Danuardi Saputro
+# Username Dicoding: dnnuuyzzo
+# Proyek Akhir: Pengembangan dan Pengoperasian Sistem Machine Learning (MLOps)
+================================================================================
+
+[CELL 1 - MARKDOWN]
+# **Machine Learning Pipeline - Credit Card Customers Churn Prediction**
+**Nama:** Danuardi Saputro  
+**Username Dicoding:** dnnuuyzzo  
+
+---
+
+### **Ringkasan Proyek & Konteks Bisnis**
+Proyek ini mengimplementasikan *end-to-end* Machine Learning Pipeline berbasis **TensorFlow Extended (TFX)** untuk memprediksi risiko nasabah berhenti menggunakan layanan kartu kredit (*Customer Churn / Attrited Customer*).
+
+Pipeline MLOps ini mencakup seluruh siklus hidup pengembangan model:
+1. **Data Ingestion (`CsvExampleGen`)**: Memuat dataset raw dan mengonversinya menjadi format standar `tf.train.Example` (TFRecord) dengan pembagian partisi train dan eval.
+2. **Data Validation (`StatisticsGen`, `SchemaGen`, `ExampleValidator`)**: Mengekstraksi statistik deskriptif data, menyusun skema data inferensi (*data contract*), dan memvalidasi anomali/drift pada data.
+3. **Data Preprocessing (`Transform`)**: Melakukan rekayasa fitur (*feature engineering*), penskalaan z-score numerik, serta pembuatan integer vocabularies kategorikal dengan graph hermetik untuk mencegah *training-serving skew*.
+4. **Hyperparameter Tuning (`Tuner`)**: Melakukan optimasi otomatis terhadap arsitektur dan parameter pelatihan menggunakan `KerasTuner`.
+5. **Model Training (`Trainer`)**: Melatih model Deep Neural Network (DNN) menggunakan Keras dengan *best hyperparameters* dan menyematkan graph preprocessing pada *serving signature*.
+6. **Model Analysis & Evaluation (`Resolver`, `Evaluator`)**: Mengevaluasi model kandidat terhadap baseline model menggunakan TensorFlow Model Analysis (TFMA) dengan metrik AUC, Accuracy, Precision, Recall, serta pengujian keadilan (*fairness slicing*).
+7. **Model Deployment (`Pusher`)**: Mendistribusikan model yang telah lolos uji kelayakan (*blessed*) ke direktori serving untuk inferensi via TensorFlow Serving.
+
+---
+
+[CELL 2 - CODE]
+import os
+import tensorflow as tf
+import tfx
+from tfx.orchestration.experimental.interactive.interactive_context import InteractiveContext
+
+print(f"TensorFlow Version : {tf.__version__}")
+print(f"TFX Version        : {tfx.__version__}")
+
+---
+
+[CELL 3 - MARKDOWN]
+## **1. Inisialisasi Pipeline Root & Konfigurasi Lingkungan**
+
+Pada tahap inisialisasi ini, kita menyiapkan lingkungan kerja pipeline TFX interaktif menggunakan `InteractiveContext`.
+- `PIPELINE_NAME`: Menentukan nama pipeline sekaligus direktori root (`dnnuuyzzo-pipeline/`) tempat seluruh artefak komponen dan metadata execution disimpan (`metadata.sqlite`).
+- `DATA_ROOT`: Menentukan lokasi direktori dataset input raw (`data/`).
+- `TRANSFORM_MODULE_FILE`, `TUNER_MODULE_FILE`, `TRAINER_MODULE_FILE`: Lokasi modul Python untuk transformasi, tuning, dan pelatihan model.
+- `SERVING_MODEL_DIR`: Lokasi direktori target tempat model yang lolos evaluasi (*blessed*) akan diekspor dan siap dilayani oleh TensorFlow Serving.
+
+---
+
+[CELL 4 - CODE]
+PIPELINE_NAME = "dnnuuyzzo-pipeline"
+DATA_ROOT = "data"
+TRANSFORM_MODULE_FILE = os.path.join("modules", "dnnuuyzzo_transform.py")
+TUNER_MODULE_FILE = os.path.join("modules", "dnnuuyzzo_tuner.py")
+TRAINER_MODULE_FILE = os.path.join("modules", "dnnuuyzzo_trainer.py")
+SERVING_MODEL_DIR = os.path.join("serving_model_dir", "credit_card_churn_model")
+
+# Inisialisasi Interactive Context TFX
+context = InteractiveContext(pipeline_root=PIPELINE_NAME)
+print("InteractiveContext berhasil diinisialisasi pada root:", PIPELINE_NAME)
+
+---
+
+[CELL 5 - MARKDOWN]
+## **2. Data Ingestion (CsvExampleGen)**
+
+Komponen `CsvExampleGen` bertanggung jawab untuk:
+1. Membaca dataset format CSV dari folder sumber data (`DATA_ROOT`).
+2. Mengonversi setiap baris data menjadi representasi biner terstandarisasi `tf.train.Example` dan menyimpannya dalam format file `TFRecord` terkompresi GZIP.
+3. Secara otomatis membagi data menjadi dua partisi independen: **train split** (2/3 atau ~67%) dan **eval split** (1/3 atau ~33%).
+4. Pembagian data di awal pipeline ini memastikan proses evaluasi model di tahap selanjutnya bersifat objektif dan mencegah kebocoran data (*data leakage*).
+
+---
+
+[CELL 6 - CODE]
+from tfx.components import CsvExampleGen
+
+example_gen = CsvExampleGen(input_base=DATA_ROOT)
+context.run(example_gen)
+print("CsvExampleGen selesai dieksekusi.")
+
+---
+
+[CELL 7 - MARKDOWN]
+## **3. Data Profiling & Extraction (StatisticsGen)**
+
+Komponen `StatisticsGen` bertugas untuk:
+1. Mengalkulasi statistik deskriptif secara komprehensif untuk seluruh fitur pada partisi `train` dan `eval`.
+2. Menghitung ringkasan numerikal (mean, standar deviasi, min, median, max, persentase nilai nol).
+3. Menghitung ringkasan kategorikal (jumlah nilai unik, frekuensi kemunculan kategori, *top value*).
+4. Statistik ini menjadi fondasi bagi pembentukan skema data dan pendeteksian anomali data di tahap selanjutnya.
+
+---
+
+[CELL 8 - CODE]
+from tfx.components import StatisticsGen
+
+statistics_gen = StatisticsGen(examples=example_gen.outputs['examples'])
+context.run(statistics_gen)
+context.show(statistics_gen.outputs['statistics'])
+
+---
+
+[CELL 9 - MARKDOWN]
+## **4. Data Schema Generation (SchemaGen)**
+
+Komponen `SchemaGen` berfungsi untuk:
+1. Menginferensi skema data resmi (*data contract*) berdasarkan statistik yang dihasilkan oleh `StatisticsGen`.
+2. Mendefinisikan tipe data yang diharapkan untuk setiap kolom (INT, FLOAT, STRING/BYTES).
+3. Mendefinisikan domain nilai yang valid untuk fitur-fitur kategorikal (`Gender`, `Education_Level`, `Marital_Status`, `Income_Category`, `Card_Category`).
+4. Menetapkan aturan kelengkapan data (*presence requirements*) agar data yang masuk ke pipeline selalu konsisten.
+
+---
+
+[CELL 10 - CODE]
+from tfx.components import SchemaGen
+
+schema_gen = SchemaGen(
+    statistics=statistics_gen.outputs['statistics'],
+    infer_feature_shape=True
+)
+context.run(schema_gen)
+context.show(schema_gen.outputs['schema'])
+
+---
+
+[CELL 11 - MARKDOWN]
+## **5. Data Validation & Anomaly Detection (ExampleValidator)**
+
+Komponen `ExampleValidator` bertanggung jawab untuk:
+1. Memvalidasi dataset terhadap skema data inferensi yang telah disepakati.
+2. Memeriksa apakah terdapat anomali seperti nilai di luar domain, *missing values* yang tidak diizinkan, tipe data yang tidak sesuai, atau ketidaksesuaian distribusi (*schema drift*).
+3. Mengembalikan status validasi (*anomalies summary*) untuk memastikan hanya data berkualitas yang diproses ke tahap rekayasa fitur.
+
+---
+
+[CELL 12 - CODE]
+from tfx.components import ExampleValidator
+
+example_validator = ExampleValidator(
+    statistics=statistics_gen.outputs['statistics'],
+    schema=schema_gen.outputs['schema']
+)
+context.run(example_validator)
+context.show(example_validator.outputs['anomalies'])
+
+---
+
+[CELL 13 - MARKDOWN]
+## **6. Data Preprocessing & Feature Engineering (Transform)**
+
+Komponen `Transform` memanfaatkan modul eksternal `modules/dnnuuyzzo_transform.py` untuk:
+1. **Standarisasi Fitur Numerik:** Menskalakan 14 fitur numerik menggunakan *z-score normalization* (`tft.scale_to_z_score`).
+2. **Transformasi Fitur Kategorikal:** Mengonversi 5 fitur kategorikal menjadi representasi indeks integer (`tft.compute_and_apply_vocabulary`) lengkap dengan OOV (*out-of-vocabulary*) bucket.
+3. **Hermetic Preprocessing Graph:** Mengompilasi seluruh logika transformasi ke dalam sebuah `tf.Graph` mandiri (*preprocessing graph*) yang disimpan ke dalam artefak `transform_graph`. Graph ini disematkan langsung saat serving untuk menjamin konsistensi 100% antara masa *training* dan *serving* (*zero training-serving skew*).
+4. Menggunakan parameter `disable_analyzer_cache=True` untuk memastikan kompatibilitas path eksekusi pada Apache Beam di lingkungan Windows.
+
+---
+
+[CELL 14 - CODE]
+from tfx.components import Transform
+
+transform = Transform(
+    examples=example_gen.outputs['examples'],
+    schema=schema_gen.outputs['schema'],
+    module_file=os.path.abspath(TRANSFORM_MODULE_FILE),
+    disable_analyzer_cache=True
+)
+context.run(transform)
+print("Transform component selesai dieksekusi.")
+
+---
+
+[CELL 15 - MARKDOWN]
+## **7. Hyperparameter Tuning (Tuner)**
+
+Komponen `Tuner` mengoptimasikan arsitektur dan parameter pelatihan secara otomatis menggunakan `KerasTuner` melalui modul `modules/dnnuuyzzo_tuner.py`:
+1. Melakukan pencarian kombinasi hyperparameter terbaik (*RandomSearch*):
+   - Jumlah lapisan *Dense* (1 hingga 3 layer).
+   - Jumlah unit per layer (32, 64, 96, 128).
+   - Tingkat *Dropout* (0.1 hingga 0.4).
+   - Dimensi *Embedding* fitur kategorikal (4 hingga 16).
+   - *Learning Rate* Adam optimizer (0.01, 0.001, 0.0001).
+2. Mengevaluasi performa model kandidat pada dataset evaluasi dengan objektif memaksimalkan `val_auc`.
+3. Menghasilkan artefak *best hyperparameters* untuk diteruskan ke komponen `Trainer`.
+
+---
+
+[CELL 16 - CODE]
+from tfx.components import Tuner
+from tfx.proto import trainer_pb2
+
+tuner = Tuner(
+    module_file=os.path.abspath(TUNER_MODULE_FILE),
+    examples=transform.outputs['transformed_examples'],
+    transform_graph=transform.outputs['transform_graph'],
+    schema=schema_gen.outputs['schema'],
+    train_args=trainer_pb2.TrainArgs(splits=['train'], num_steps=50),
+    eval_args=trainer_pb2.EvalArgs(splits=['eval'], num_steps=20)
+)
+context.run(tuner)
+print("Tuner component selesai dieksekusi.")
+
+---
+
+[CELL 17 - MARKDOWN]
+## **8. Model Training (Trainer)**
+
+Komponen `Trainer` menggunakan modul `modules/dnnuuyzzo_trainer.py` untuk:
+1. Membangun arsitektur Deep Neural Network (DNN) menggunakan *best hyperparameters* dari artefak `Tuner`.
+2. Melatih model menggunakan data yang telah ditransformasi (`transformed_examples`).
+3. Mengintegrasikan *callback EarlyStopping* dan *TensorBoard* untuk memantau proses konvergensi model.
+4. Menyematkan graph preprocessing dari `transform_graph` ke dalam *serving signature* (`serving_default`), sehingga model yang diekspor dapat langsung menerima input raw string dan numeric terenkapsulasi `tf.train.Example`.
+
+---
+
+[CELL 18 - CODE]
+from tfx.components import Trainer
+from tfx.proto import trainer_pb2
+
+trainer = Trainer(
+    module_file=os.path.abspath(TRAINER_MODULE_FILE),
+    examples=transform.outputs['transformed_examples'],
+    transform_graph=transform.outputs['transform_graph'],
+    schema=schema_gen.outputs['schema'],
+    hyperparameters=tuner.outputs['best_hyperparameters'],
+    train_args=trainer_pb2.TrainArgs(splits=['train'], num_steps=50),
+    eval_args=trainer_pb2.EvalArgs(splits=['eval'], num_steps=20)
+)
+context.run(trainer)
+print("Trainer component selesai dieksekusi.")
+
+---
+
+[CELL 19 - MARKDOWN]
+## **9. Baseline Model Resolver (ResolverNode)**
+
+Komponen `Resolver` (menggunakan `LatestBlessedModelResolver`) bertugas untuk:
+1. Mencari dan mengambil model versi terdahulu yang telah berstatus *blessed* dari ML Metadata store.
+2. Menyediakan model baseline tersebut kepada komponen `Evaluator` agar dapat dilakukan perbandingan performa (*candidate model vs baseline model*).
+
+---
+
+[CELL 20 - CODE]
+from tfx.dsl.components.common.resolver import Resolver
+from tfx.dsl.input_resolution.strategies.latest_blessed_model_strategy import (
+    LatestBlessedModelStrategy
+)
+from tfx.types import Channel
+from tfx.types.standard_artifacts import Model, ModelBlessing
+
+model_resolver = Resolver(
+    strategy_class=LatestBlessedModelStrategy,
+    model=Channel(type=Model),
+    model_blessing=Channel(type=ModelBlessing)
+).with_id('Latest_blessed_model_resolver')
+
+context.run(model_resolver)
+print("Resolver component selesai dieksekusi.")
+
+---
+
+[CELL 21 - MARKDOWN]
+## **10. Model Evaluation & Fairness Analysis (Evaluator)**
+
+Komponen `Evaluator` menggunakan **TensorFlow Model Analysis (TFMA)** untuk:
+1. Mengevaluasi performa model kandidat secara menyeluruh dengan metrik:
+   - **AUC (Area Under ROC Curve)**: Ambang batas minimal (lower bound >= 0.50).
+   - **Binary Accuracy**, **Precision**, dan **Recall**.
+2. Melakukan evaluasi *fairness slicing* berdasarkan fitur demografi `Gender` (`M` dan `F`) guna memastikan model tidak memiliki bias diskriminatif terhadap kelompok gender tertentu.
+3. Memberikan status *blessing* (`BLESSED` atau `NOT_BLESSED`) berdasarkan pencapaian kriteria ambang batas validasi.
+
+---
+
+[CELL 22 - CODE]
+import tensorflow_model_analysis as tfma
+from tfx.components import Evaluator
+
+eval_config = tfma.EvalConfig(
+    model_specs=[tfma.ModelSpec(label_key='Attrition_Flag')],
+    slicing_specs=[
+        tfma.SlicingSpec(),
+        tfma.SlicingSpec(feature_keys=['Gender'])
+    ],
+    metrics_specs=[
+        tfma.MetricsSpec(
+            metrics=[
+                tfma.MetricConfig(class_name='AUC'),
+                tfma.MetricConfig(class_name='BinaryAccuracy'),
+                tfma.MetricConfig(class_name='Precision'),
+                tfma.MetricConfig(class_name='Recall'),
+                tfma.MetricConfig(class_name='ExampleCount')
+            ],
+            thresholds={
+                'auc': tfma.MetricThreshold(
+                    value_threshold=tfma.GenericValueThreshold(
+                        lower_bound={'value': 0.5}
+                    ),
+                    change_threshold=tfma.GenericChangeThreshold(
+                        direction=tfma.MetricDirection.HIGHER_IS_BETTER,
+                        absolute={'value': -1e-10}
+                    )
+                )
+            }
+        )
+    ]
+)
+
+evaluator = Evaluator(
+    examples=example_gen.outputs['examples'],
+    model=trainer.outputs['model'],
+    baseline_model=model_resolver.outputs['model'],
+    eval_config=eval_config
+)
+context.run(evaluator)
+print("Evaluator component selesai dieksekusi.")
+
+---
+
+[CELL 23 - MARKDOWN]
+## **11. Model Deployment & Exporting (Pusher)**
+
+Komponen `Pusher` bertugas untuk:
+1. Memeriksa status kelayakan model (*Model Blessing*) dari komponen `Evaluator`.
+2. Jika model berstatus `BLESSED`, komponen akan mendistribusikan (*push*) model ke direktori serving yang ditentukan (`SERVING_MODEL_DIR`).
+3. Model yang berada di `SERVING_MODEL_DIR` siap dimuat oleh container **TensorFlow Serving** untuk melayani request inferensi real-time via REST API atau gRPC.
+
+---
+
+[CELL 24 - CODE]
+from tfx.components import Pusher
+from tfx.proto import pusher_pb2
+
+pusher = Pusher(
+    model=trainer.outputs['model'],
+    model_blessing=evaluator.outputs['blessing'],
+    push_destination=pusher_pb2.PushDestination(
+        filesystem=pusher_pb2.PushDestination.Filesystem(
+            base_directory=SERVING_MODEL_DIR
+        )
+    )
+)
+context.run(pusher)
+print("Pusher component selesai dieksekusi. Model siap diserve!")
