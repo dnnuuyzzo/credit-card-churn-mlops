@@ -13,7 +13,7 @@
 ---
 
 ### **Deskripsi Pengujian**
-Notebook ini digunakan untuk menguji dan memvalidasi inferensi model yang telah di-deploy pada **TensorFlow Serving** di environment Cloud (atau lokal) melalui REST API.
+Notebook ini digunakan untuk menguji dan memvalidasi inferensi model yang telah di-deploy pada **TensorFlow Serving** di environment Cloud Railway melalui REST API.
 
 Pengujian mencakup:
 1. Pemeriksaan status dan kesiapan model (*health check* & *metadata inspection*).
@@ -36,18 +36,15 @@ print(f"Requests Version  : {requests.__version__}")
 ---
 
 [CELL 3 - MARKDOWN]
-## **1. Konfigurasi Endpoint TensorFlow Serving**
+## **1. Konfigurasi Endpoint TensorFlow Serving (Cloud Railway)**
 
-Menentukan host, URL model, serta endpoint REST API.
-- Untuk pengujian di **Cloud Environment (misal: Railway / Heroku / Koyeb / Render)**, ganti variabel `SERVER_BASE_URL` dengan URL cloud aplikasi Anda.
-- Untuk pengujian di **Lokal Docker**, gunakan `http://localhost:8501`.
+Menentukan host, URL model, serta endpoint REST API di platform Cloud Railway.
 
 ---
 
 [CELL 4 - CODE]
-# Konfigurasi URL Endpoint (Ubah URL ini sesuai domain cloud deployment Anda)
-SERVER_BASE_URL = "http://localhost:8501" 
-# Contoh Cloud: SERVER_BASE_URL = "https://dnnuuyzzo-churn-model.up.railway.app"
+# Konfigurasi URL Endpoint Cloud Deployment Railway
+SERVER_BASE_URL = "https://credit-card-churn-mlops-production.up.railway.app"
 
 MODEL_NAME = "credit_card_churn_model"
 
@@ -64,15 +61,15 @@ print(f"Predict URL  : {PREDICT_URL}")
 [CELL 5 - MARKDOWN]
 ## **2. Memeriksa Status & Metadata Model (Health Check)**
 
-Melakukan HTTP GET request untuk memverifikasi bahwa container TensorFlow Serving aktif dan model berada dalam kondisi `AVAILABLE`.
+Melakukan HTTP GET request untuk memverifikasi bahwa container TensorFlow Serving aktif di cloud dan model berada dalam kondisi `AVAILABLE`.
 
 ---
 
 [CELL 6 - CODE]
 try:
-    response = requests.get(STATUS_URL, timeout=10)
+    response = requests.get(METADATA_URL, timeout=15)
     print(f"HTTP Status Code: {response.status_code}")
-    print("Response Body:")
+    print("Response Metadata JSON:")
     print(json.dumps(response.json(), indent=2))
 except Exception as e:
     print(f"Koneksi gagal atau model belum aktif: {e}")
@@ -210,9 +207,9 @@ print(f"Payload request berhasil dibuat untuk {len(payload['instances'])} instan
 ---
 
 [CELL 11 - MARKDOWN]
-## **5. Mengirimkan Prediction Request ke REST API**
+## **5. Mengirimkan Prediction Request ke REST API Cloud**
 
-Mengirimkan HTTP POST request berisi payload serialisasi ke `PREDICT_URL` dan membaca respons prediksi dari model.
+Mengirimkan HTTP POST request berisi payload serialisasi ke `PREDICT_URL` dan membaca respons prediksi dari model serving di cloud.
 
 ---
 

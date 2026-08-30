@@ -1,14 +1,13 @@
-﻿global:
+global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  external_labels:
+    monitor: "tf-serving-monitor"
 
 scrape_configs:
-  - job_name: 'prometheus'
+  - job_name: "prometheus"
+    scrape_interval: 5s
+    scheme: https
+    metrics_path: /monitoring/prometheus/metrics
     static_configs:
-      - targets: ['localhost:9090']
-
-  - job_name: 'tensorflow_serving_churn'
-    metrics_path: '/monitoring/prometheus/metrics'
-    scrape_interval: 10s
-    static_configs:
-      - targets: ['host.docker.internal:8501', 'localhost:8501', 'credit-card-churn-serving:8501']
+      - targets: ['credit-card-churn-mlops-production.up.railway.app']

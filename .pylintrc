@@ -1,0 +1,8 @@
+﻿[MAIN]
+disable=
+    missing-module-docstring,
+    too-many-locals,
+    unused-argument,
+    broad-exception-caught,
+    duplicate-code,
+    mixed-line-endings
